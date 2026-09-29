@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ระบบโหวตบนบล็อกเชน</title>
+<link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;600;800&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.4/ethers.umd.min.js"></script>
+<style>
+:root{--bg:#e9eef2;--card:#fff;--ink:#12202c;--mute:#5b6b78;--line:#cfd8df;--acc:#0b5fd6;--bar:#cfe0fb;--ok:#137a4b;--err:#b3261e}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1720;--card:#16232f;--ink:#e6edf3;--mute:#93a4b3;--line:#2a3b4a;--acc:#5b9dff;--bar:#1f3a63;--ok:#4cc38a;--err:#ff8a80}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:'Sarabun',system-ui,sans-serif;line-height:1.6}
+main{max-width:720px;margin:0 auto;padding:28px 16px 64px}
+h1{font-size:2rem;font-weight:800;margin:0 0 4px}
+h2{font-size:1.1rem;margin:0 0 12px}
+.sub{color:var(--mute);margin:0 0 24px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:16px}
+label{display:block;font-weight:600;margin:10px 0 4px}
+input{width:100%;padding:10px;border:1px solid var(--line);border-radius:6px;background:transparent;color:var(--ink);font:inherit}
+input:focus-visible,button:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+button{font:inherit;font-weight:600;padding:10px 16px;border-radius:6px;border:1px solid var(--acc);background:var(--acc);color:#fff;cursor:pointer}
+button.ghost{background:transparent;color:var(--acc)}
+button:disabled{opacity:.5;cursor:not-allowed}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.row input{flex:1;min-width:0}
+.opt{position:relative;display:flex;justify-content:space-between;align-items:center;gap:10px;border:1px solid var(--line);border-radius:6px;padding:10px 12px;margin-top:8px;overflow:hidden}
+.opt .fill{position:absolute;inset:0 auto 0 0;background:var(--bar);transition:width .5s}
+.opt span,.opt button{position:relative}
+.opt button{padding:4px 12px}
+.meta{color:var(--mute);font-size:.9rem}
+.status{min-height:1.5em;font-size:.95rem}
+.status.ok{color:var(--ok)}.status.err{color:var(--err)}
+.pill{display:inline-block;border-radius:99px;padding:0 10px;font-size:.85rem;border:1px solid var(--line)}
+.live{color:var(--ok)}
+</style>
+</head>
+<body>
+<main>
+  <h1>ระบบโหวตบนบล็อกเชน</h1>
+  <p class="sub">หนึ่งกระเป๋าโหวตได้หนึ่งครั้งต่อหัวข้อ และผลโหวตอัปเดตทันที</p>
+
+  <section class="card">
+    <h2>เชื่อมต่อ</h2>
+    <label for="addr">ที่อยู่ Smart contract (ที่ได้จากการ deploy)</label>
+    <div class="row">
+      <input id="addr" placeholder="0x...">
+      <button id="connect">เชื่อมต่อ MetaMask</button>
+    </div>
+    <p class="meta" id="acct"></p>
+  </section>
+
+  <section class="card" id="createCard" hidden>
+    <h2>สร้างหัวข้อโหวตใหม่</h2>
+    <label for="title">หัวข้อ</label>
+    <input id="title" placeholder="เช่น วันเสาร์นี้กินอะไรดี">
+    <label for="opts">ตัวเลือก (คั่นด้วยเครื่องหมายจุลภาค อย่างน้อย 2 ตัวเลือก)</label>
+    <input id="opts" placeholder="ข้าวมันไก่, ก๋วยเตี๋ยว, ส้มตำ">
+    <label for="mins">เปิดโหวตกี่นาที</label>
+    <input id="mins" type="number" min="1" value="60">
+    <p><button id="create">สร้างหัวข้อโหวต</button></p>
+  </section>
+
+  <p class="status" id="status" role="status"></p>
+  <div id="polls"></div>
+</main>
+
+<script>
+const ABI = [
+  "function createPoll(string title, string[] options, uint256 durationInSeconds) returns (uint256)",
+  "function vote(uint256 pollId, uint256 optionIndex)",
+  "function getPoll(uint256) view returns (string title, string[] options, uint256[] votes, uint256 endTime, address creator)",
+  "function pollCount() view returns (uint256)",
+  "function hasVoted(uint256, address) view returns (bool)",
+  "event Voted(uint256 indexed pollId, address indexed voter, uint256 optionIndex)",
+  "event PollCreated(uint256 indexed pollId, string title, address indexed creator, uint256 endTime)"
+];
+const $ = id => document.getElementById(id);
+let contract, account, timer;
+
+try { $('addr').value = localStorage.getItem('votingAddr') || ''; } catch (e) {}
+
+function say(msg, cls = '') { const s = $('status'); s.textContent = msg; s.className = 'status ' + cls; }
+function esc(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
+function errText(e) { return e.reason || e.shortMessage || (e.info && e.info.error && e.info.error.message) || e.message || String(e); }
+
+$('connect').onclick = async () => {
+  try {
+    if (!window.ethereum) return say('ไม่พบ MetaMask กรุณาติดตั้งส่วนเสริมบนเบราว์เซอร์ก่อน', 'err');
+    const address = $('addr').value.trim();
+    if (!ethers.isAddress(address)) return say('ที่อยู่ contract ไม่ถูกต้อง', 'err');
+    const provider = new ethers.BrowserProvider(window.ethereum);
+    const signer = await provider.getSigner();
+    account = await signer.getAddress();
+    const net = await provider.getNetwork();
+    contract = new ethers.Contract(address, ABI, signer);
+    await contract.pollCount();
+    try { localStorage.setItem('votingAddr', address); } catch (e) {}
+    $('acct').textContent = 'กระเป๋า: ' + account.slice(0, 6) + '...' + account.slice(-4) + ' (chain ' + net.chainId + ')';
+    $('createCard').hidden = false;
+    contract.removeAllListeners();
+    contract.on('Voted', () => loadPolls());
+    contract.on('PollCreated', () => loadPolls());
+    clearInterval(timer);
+    timer = setInterval(loadPolls, 15000);
+    say('เชื่อมต่อสำเร็จ', 'ok');
+    loadPolls();
+  } catch (e) {
+    say('เชื่อมต่อไม่สำเร็จ: ตรวจสอบว่าเลือกเครือข่าย Sepolia และใส่ที่อยู่ contract ถูกต้อง (' + errText(e) + ')', 'err');
+  }
+};
+
+$('create').onclick = async () => {
+  const title = $('title').value.trim();
+  const options = $('opts').value.split(',').map(s => s.trim()).filter(Boolean);
+  const mins = Number($('mins').value);
+  if (!title || options.length < 2 || !(mins > 0)) return say('กรอกหัวข้อ ตัวเลือกอย่างน้อย 2 ตัว และเวลาให้ครบ', 'err');
+  try {
+    say('กรุณายืนยันธุรกรรมใน MetaMask...');
+    const tx = await contract.createPoll(title, options, Math.round(mins * 60));
+    say('กำลังรอการยืนยันบนบล็อกเชน...');
+    await tx.wait();
+    $('title').value = ''; $('opts').value = '';
+    say('สร้างหัวข้อโหวตแล้ว', 'ok');
+    loadPolls();
+  } catch (e) { say('สร้างไม่สำเร็จ: ' + errText(e), 'err'); }
+};
+
+async function castVote(pollId, idx) {
+  try {
+    say('กรุณายืนยันธุรกรรมใน MetaMask...');
+    const tx = await contract.vote(pollId, idx);
+    say('กำลังรอการยืนยันบนบล็อกเชน...');
+    await tx.wait();
+    say('โหวตแล้ว', 'ok');
+    loadPolls();
+  } catch (e) { say('โหวตไม่สำเร็จ: ' + errText(e), 'err'); }
+}
+
+async function loadPolls() {
+  if (!contract) return;
+  try {
+    const n = Number(await contract.pollCount());
+    const box = $('polls');
+    if (n === 0) { box.innerHTML = '<p class="meta">ยังไม่มีหัวข้อโหวต สร้างหัวข้อแรกได้ด้านบน</p>'; return; }
+    const now = Math.floor(Date.now() / 1000);
+    let html = '';
+    for (let id = n - 1; id >= 0; id--) {
+      const [title, options, votes, endTime] = await contract.getPoll(id);
+      const voted = await contract.hasVoted(id, account);
+      const total = votes.reduce((a, v) => a + Number(v), 0);
+      const open = now < Number(endTime);
+      const left = Number(endTime) - now;
+      const state = open
+        ? '<span class="pill live">เปิดโหวต เหลือ ' + (left >= 3600 ? Math.floor(left / 3600) + ' ชม. ' : '') + Math.ceil((left % 3600) / 60) + ' นาที</span>'
+        : '<span class="pill">ปิดโหวตแล้ว</span>';
+      html += '<article class="card"><h2>' + esc(title) + '</h2><p class="meta">' + state + ' รวม ' + total + ' โหวต' + (voted ? ' · คุณโหวตแล้ว' : '') + '</p>';
+      options.forEach((o, i) => {
+        const v = Number(votes[i]);
+        const pct = total ? Math.round(v * 100 / total) : 0;
+        const btn = open && !voted ? '<button data-p="' + id + '" data-o="' + i + '">โหวต</button>' : '';
+        html += '<div class="opt"><div class="fill" style="width:' + pct + '%"></div><span>' + esc(o) + ' — ' + v + ' (' + pct + '%)</span>' + btn + '</div>';
+      });
+      html += '</article>';
+    }
+    box.innerHTML = html;
+    box.querySelectorAll('button[data-p]').forEach(b => b.onclick = () => castVote(Number(b.dataset.p), Number(b.dataset.o)));
+  } catch (e) { say('โหลดข้อมูลไม่สำเร็จ: ' + errText(e), 'err'); }
+}
+</script>
+</body>
+</html>
